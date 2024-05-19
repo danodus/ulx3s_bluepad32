@@ -4,6 +4,14 @@
 #include <string.h>
 
 #include <uni.h>
+#include <uni_gpio.h>
+
+// GPIO for SPI interface
+
+static const gpio_num_t GPIO_SPI_CSN = GPIO_NUM_19; //GPIO_NUM_5;
+static const gpio_num_t GPIO_SPI_CLK = GPIO_NUM_26; //GPIO_NUM_16;
+static const gpio_num_t GPIO_SPI_MOSI = GPIO_NUM_4;
+//static const gpio_num_t GPIO_SPI_MISO = GPIO_NUM_12;
 
 // Custom "instance"
 typedef struct my_platform_instance_s {
@@ -14,6 +22,25 @@ typedef struct my_platform_instance_s {
 static void trigger_event_on_gamepad(uni_hid_device_t* d);
 static my_platform_instance_t* get_my_platform_instance(uni_hid_device_t* d);
 
+// SPI write of gamepad state to FPGA
+static void spi_write_gamepad_state(const uni_gamepad_t* pad) {
+    uint32_t pad_bits = pad->buttons;
+    pad_bits |= (pad->dpad << 16);
+
+    gpio_set_level(GPIO_SPI_CLK, 0);
+    gpio_set_level(GPIO_SPI_CSN, 0);
+
+    for (uint32_t i = 0; i < 32; i++) {
+        gpio_set_level(GPIO_SPI_MOSI, pad_bits & 1);
+        gpio_set_level(GPIO_SPI_CLK, 1);
+        gpio_set_level(GPIO_SPI_CLK, 0);
+
+        pad_bits >>= 1;
+    }
+
+    gpio_set_level(GPIO_SPI_CSN, 1);
+}
+
 //
 // Platform Overrides
 //
@@ -22,6 +49,20 @@ static void my_platform_init(int argc, const char** argv) {
     ARG_UNUSED(argv);
 
     logi("custom: init()\n");
+
+    gpio_config_t io_conf;
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+
+    // GPIO configuration for SPI
+    io_conf.pin_bit_mask = (
+        1 << GPIO_SPI_CSN | 1 << GPIO_SPI_CLK | 1 << GPIO_SPI_MOSI
+    );
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    gpio_set_level(GPIO_SPI_CSN, 1);    
 
 #if 0
     uni_gamepad_mappings_t mappings = GAMEPAD_DEFAULT_MAPPINGS;
@@ -95,36 +136,10 @@ static void my_platform_on_controller_data(uni_hid_device_t* d, uni_controller_t
     switch (ctl->klass) {
         case UNI_CONTROLLER_CLASS_GAMEPAD:
             gp = &ctl->gamepad;
+            
+            // All updates are sent over SPI
+            spi_write_gamepad_state(gp);
 
-            // Debugging
-            // Axis ry: control rumble
-            if ((gp->buttons & BUTTON_A) && d->report_parser.play_dual_rumble != NULL) {
-                d->report_parser.play_dual_rumble(d, 0 /* delayed start ms */, 250 /* duration ms */,
-                                                  255 /* weak magnitude */, 0 /* strong magnitude */);
-            }
-            // Buttons: Control LEDs On/Off
-            if ((gp->buttons & BUTTON_B) && d->report_parser.set_player_leds != NULL) {
-                d->report_parser.set_player_leds(d, leds++ & 0x0f);
-            }
-            // Axis: control RGB color
-            if ((gp->buttons & BUTTON_X) && d->report_parser.set_lightbar_color != NULL) {
-                uint8_t r = (gp->axis_x * 256) / 512;
-                uint8_t g = (gp->axis_y * 256) / 512;
-                uint8_t b = (gp->axis_rx * 256) / 512;
-                d->report_parser.set_lightbar_color(d, r, g, b);
-            }
-
-            // Toggle Bluetooth connections
-            if ((gp->buttons & BUTTON_SHOULDER_L) && enabled) {
-                logi("*** Disabling Bluetooth connections\n");
-                uni_bt_enable_new_connections_safe(false);
-                enabled = false;
-            }
-            if ((gp->buttons & BUTTON_SHOULDER_R) && !enabled) {
-                logi("*** Enabling Bluetooth connections\n");
-                uni_bt_enable_new_connections_safe(true);
-                enabled = true;
-            }
             break;
         default:
             break;
